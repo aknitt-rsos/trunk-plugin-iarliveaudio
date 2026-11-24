@@ -70,7 +70,6 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        env: { RUSTFLAGS: "-C target-feature=+crt-static" }
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
           echo "BIN=target/${{ matrix.target }}/release/$ID.exe" >> "$GITHUB_ENV"
