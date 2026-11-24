@@ -1,0 +1,16 @@
+{
+  "apiKey": "YOUR-IAR-LIVE-AUDIO-API-KEY",
+  "channels": [
+    {
+      "id": "IAR_CHANNEL_ID",
+      "name": "Dispatch Live",
+      "description": "Example channel",
+      "enabled": true,
+      "scanMode": "priority_scan",
+      "sources": [
+        { "systems": ["county_p25"], "talkgroups": ["1000-1099", "2001"] },
+        { "systems": [], "talkgroups": ["0"] }
+      ]
+    }
+  ]
+}

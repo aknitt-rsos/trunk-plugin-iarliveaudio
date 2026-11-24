@@ -1,0 +1,26 @@
+[package]
+name = "iarliveaudio"
+version = "0.1.0"
+edition = "2024"
+description = "Sends Trunk Recorder Pro call audio directly to IamResponding Live Audio channels."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/aknitt-rsos/trunk-plugin-iarliveaudio"
+authors = ["Andy Knitt"]
+publish = false
+
+[dependencies]
+trunk-recorder-plugin = "0.15.1"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTPS for the channel list. Pure Rust TLS, so there is no OpenSSL to build or ship.
+ureq = { version = "3", features = ["json"] }
+# WebSocket to the IaR audio server. Pure Rust TLS with the Mozilla root store built in.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Opus encoder, compiled from the bundled source and linked statically: no system libopus needed.
+libopus_sys = { version = "0.4", features = ["bundled", "static"] }
+
+[profile.release]
+strip = true
+lto = true
