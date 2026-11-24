@@ -23,7 +23,7 @@ use trunk_recorder_plugin::{
 };
 
 use channel::{Candidate, Cmd, Lane};
-use config::{Channel, ChannelConfig, Config, compile_all, merge};
+use config::{Channel, ChannelConfig, Config, compile_all, fill_sending, merge};
 use iar_api::{CHANNELS_URL, WS_BASE};
 
 /// Where the plugin talks to IaR. Production unless a test says otherwise.
@@ -110,6 +110,11 @@ impl IarLiveAudio {
         compile_all(&config)?;
         let key_changed = config.api_key != self.config.api_key;
         self.config = config;
+        // Each card's summary line comes from its rules. Saving it makes the recorder send the settings
+        // back, and then nothing has changed, so that is the end of it.
+        if fill_sending(&mut self.config.channels) {
+            self.host.save_settings(&json!({ "channels": self.config.channels }));
+        }
         self.sync_routes(key_changed);
         if !self.config.api_key.is_empty() && self.config.api_key != self.discovered_key {
             let (key, saved) = (self.config.api_key.clone(), self.config.channels.clone());
@@ -156,7 +161,8 @@ impl IarLiveAudio {
         let (host, url, found) = (self.host.clone(), self.endpoints.channels_url.clone(), self.found_tx.clone());
         thread::spawn(move || match iar_api::fetch(&url, &api_key) {
             Ok(listed) => {
-                let merged = merge(&saved, &listed);
+                let mut merged = merge(&saved, &listed);
+                fill_sending(&mut merged.channels);
                 let missing = merged.missing.len();
                 let mut settings = json!({ "channels": merged.channels });
                 if save_key {
@@ -600,29 +606,72 @@ mod tests {
         assert!(drain(&ws, Duration::from_millis(300)).is_empty(), "off: nothing is sent");
     }
 
-    #[test]
-    fn entering_a_key_fetches_the_channels_and_saves_them_with_the_rules() {
-        let saved = settings_with("", config::ScanMode::Scan, &[(&[], &["101"])]);
-        let (mut p, _ws, _h, cap, api) = plugin(saved, LISTING);
-        p.settings(Setup { config: Config { api_key: "k".into(), ..Default::default() }, ..setup_for_tests() }).expect("settings");
-        // The listing arrives on a thread: wait for the save it makes.
-        let mut saved_settings = None;
+    /// Every settings save the plugin has made so far.
+    fn saves(cap: &testing::Captured) -> Vec<serde_json::Value> {
+        cap.output()
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                PluginMessage::SettingsSave { settings, .. } => Some(serde_json::Value::Object(settings.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits for the save the channel listing makes (the one carrying IaR's description) and returns it.
+    fn listing_save(p: &mut IarLiveAudio, cap: &testing::Captured) -> serde_json::Value {
         for _ in 0..100 {
             p.poll();
-            saved_settings = cap.output().messages.iter().find_map(|m| match m {
-                PluginMessage::SettingsSave { settings, .. } => Some(settings.clone()),
-                _ => None,
-            });
-            if saved_settings.is_some() {
-                break;
+            if let Some(s) = saves(cap).into_iter().find(|s| s["channels"][0]["description"] == "Main") {
+                return s;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        let saved_settings = saved_settings.expect("settings saved");
-        assert_eq!(saved_settings["channels"][0]["id"], "42");
-        assert_eq!(saved_settings["channels"][0]["name"], "Dispatch");
-        assert_eq!(saved_settings["channels"][0]["enabled"], false, "a new channel starts off");
+        panic!("the channel listing was never saved");
+    }
+
+    #[test]
+    fn entering_a_key_fetches_the_channels_and_keeps_the_rules() {
+        let saved = settings_with("", config::ScanMode::Scan, &[(&[], &["101"])]);
+        let (mut p, _ws, _h, cap, api) = plugin(saved.clone(), LISTING);
+        p.settings(Setup { config: Config { api_key: "k".into(), ..saved }, ..setup_for_tests() }).expect("settings");
+        let s = listing_save(&mut p, &cap);
+        assert_eq!(s["channels"][0]["id"], "42");
+        assert_eq!(s["channels"][0]["name"], "Dispatch");
+        assert_eq!(s["channels"][0]["enabled"], true, "a channel that was set up stays on");
+        assert_eq!(s["channels"][0]["sources"][0]["talkgroups"], json!(["101"]), "and keeps its rules");
+        assert_eq!(s["channels"][0]["sending"], "Scan · 101");
         assert_eq!(api.requests()[0].header("x-api-key"), Some("k"));
+    }
+
+    #[test]
+    fn a_channel_found_for_the_first_time_starts_off_with_nothing_to_send() {
+        let (mut p, _ws, _h, cap, _api) = plugin(Config::default(), LISTING);
+        p.settings(Setup { config: Config { api_key: "k".into(), ..Default::default() }, ..setup_for_tests() }).expect("settings");
+        let s = listing_save(&mut p, &cap);
+        assert_eq!(s["channels"][0]["enabled"], false, "a new channel starts off");
+        assert_eq!(s["channels"][0]["sending"], "Scan · no talkgroups yet");
+    }
+
+    #[test]
+    fn each_cards_summary_is_saved_when_the_rules_change_and_then_left_alone() {
+        let (mut p, _ws, _h, cap, _api) = plugin(settings_with("", config::ScanMode::Scan, &[(&[], &["101", "102"])]), LISTING);
+        let first = saves(&cap);
+        assert_eq!(first.len(), 1, "the summary is filled in and saved at the start");
+        assert_eq!(first[0]["channels"][0]["sending"], "Scan · 101, 102");
+
+        // The recorder sends the saved settings back: they already say so, so nothing is saved again.
+        let mut edited = p.config.clone();
+        p.apply(edited.clone()).expect("same settings");
+        assert_eq!(saves(&cap).len(), 1, "no save, so no loop");
+
+        // The rules change, and the line follows them.
+        edited.channels[0].scan_mode = config::ScanMode::PriorityScan;
+        edited.channels[0].sources[0].talkgroups = vec!["102".into(), "101".into()];
+        p.apply(edited).expect("edited settings");
+        let all = saves(&cap);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1]["channels"][0]["sending"], "Priority scan · 102 > 101");
     }
 
     #[test]

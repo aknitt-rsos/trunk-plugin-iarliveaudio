@@ -16,11 +16,24 @@ Sends call audio from [Trunk Recorder Pro](https://github.com/aknitt-rsos/trunk-
 | --- | --- |
 | `apiKey` | Your IaR Live Audio API key. Stored as a secret. |
 | `channels[].enabled` | Turns streaming to this channel on or off. New channels start off. |
-| `channels[].scanMode` | `scan`: the first active talkgroup holds the channel. `priority_scan`: an earlier rule preempts a later one. |
-| `channels[].sources[].systems` | Systems this rule applies to. Empty means all systems. |
-| `channels[].sources[].talkgroups` | Talkgroup IDs (`101`), ranges (`1000-1099`), wildcards (`507*`), or `0` for all. |
+| `channels[].scanMode` | `scan`: the first active talkgroup holds the channel. `priority_scan`: a higher-priority talkgroup preempts a lower one (see below). |
+| `channels[].sources[].systems` | Systems this item applies to. Empty means all systems. |
+| `channels[].sources[].talkgroups` | Talkgroup IDs (`101`), ranges (`1000-1099`), wildcards (`507*`), or `0` for all. In Priority scan the order matters. |
+| `channels[].sending` | Read only. The line each channel's card shows without being opened: its scan mode and talkgroups in priority order, cut with "+N more" when long. The plugin keeps it up to date. |
 
 When you refresh channels, your settings are kept by channel ID. Channels the API no longer returns are skipped, but their rules are kept.
+
+## Priority scan
+
+There is no separate priority setting. Priority is the order you write things in, from the top down:
+
+- **Inside one item**, a talkgroup earlier in the list outranks one later in the list. `58909, 58910, 58421` means 58909 is highest and 58421 lowest.
+- **Across items**, everything in an earlier item outranks everything in a later item. Put dispatch talkgroups in Item 1 and the rest in Item 2.
+- A talkgroup listed more than once counts at its first place.
+
+When two talkgroups are on the air at once in **Priority scan**, the higher one takes the channel (the lower one's transmission ends and the higher one's starts). A lower talkgroup never interrupts a higher one: its audio is skipped while the channel is busy. In **Scan** mode the order doesn't matter. The first talkgroup to start keeps the channel until its call ends.
+
+A card's summary line shows the talkgroups in priority order, with `>` meaning "outranks": `Priority scan · 58909 > 58910 > 58421 > … +37 more`. The line is saved by the plugin, so it updates when the plugin is running and settings change.
 
 ## Multisite
 

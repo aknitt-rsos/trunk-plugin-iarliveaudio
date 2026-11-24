@@ -41,6 +41,8 @@ jobs:
           # Linux against glibc 2.28, so it runs on any distribution since ~2019 (as the recorder does).
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
+          # One binary for Apple silicon and Intel.
+          - { target: universal-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
     env:
@@ -52,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with: { key: "${{ matrix.target }}" }
 
@@ -63,6 +65,14 @@ jobs:
           cargo install cargo-zigbuild --locked
           cargo zigbuild --locked --release --target ${{ matrix.target }}.2.28
           echo "BIN=target/${{ matrix.target }}/release/$ID" >> "$GITHUB_ENV"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          lipo -create -output "$ID" "target/aarch64-apple-darwin/release/$ID" "target/x86_64-apple-darwin/release/$ID"
+          echo "BIN=$ID" >> "$GITHUB_ENV"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'

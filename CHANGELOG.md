@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Each channel's card now shows its scan mode and talkgroups, in priority order, without being opened. A long list ends "+N more".
+- The help text explains how Priority scan works: priority runs from the top, inside an item and across items.
+- Release builds for macOS (one binary for Apple silicon and Intel) are back.
+
 ## [0.1.0]
 
 - First release. Sends Trunk Recorder Pro call audio straight to IamResponding Live Audio channels, with no simplestream or IaR-Stream in between.

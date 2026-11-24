@@ -24,7 +24,7 @@ pub struct Config {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
-#[schemars(extend("x-title" = "name", "x-summary" = ["{scanMode}"]))]
+#[schemars(extend("x-title" = "name", "x-summary" = ["{sending|Not set up yet}"]))]
 pub struct ChannelConfig {
     /// Name
     #[schemars(extend("readOnly" = true))]
@@ -41,12 +41,17 @@ pub struct ChannelConfig {
     pub enabled: bool,
     /// Scan mode
     ///
-    /// With more than one talkgroup on this channel, how they share it.
+    /// What happens when two of this channel's talkgroups are on the air at once. Scan: the one that started first keeps the channel until its call ends, and the other is skipped. Priority scan: a talkgroup with higher priority takes the channel from a lower one that is already on it, and a lower one never interrupts a higher one. Priority comes from the order of the talkgroup rules below.
     pub scan_mode: ScanMode,
     /// Talkgroup rules
     ///
-    /// Each rule names the systems and talkgroups to send. Earlier rules and earlier talkgroups count as higher priority.
+    /// Each item names the systems and talkgroups to send. In Priority scan, priority runs from the top: inside one item, a talkgroup earlier in its list outranks a later one; across items, every talkgroup in an earlier item outranks every talkgroup in a later item. A talkgroup that is listed more than once counts at its first place. Scan mode ignores the order.
     pub sources: Vec<SourceRule>,
+    /// Sending
+    ///
+    /// The scan mode and the talkgroups this channel carries, highest priority first (">" means "outranks"). The plugin keeps this up to date.
+    #[schemars(extend("readOnly" = true))]
+    pub sending: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -69,7 +74,7 @@ pub struct SourceRule {
     pub systems: Vec<String>,
     /// Talkgroups
     ///
-    /// Numbers (101), ranges (1000-1099), or patterns (507*, where * is any digits and ? is one digit). 0 is every talkgroup.
+    /// Numbers (101), ranges (1000-1099), or patterns (507*, where * is any digits and ? is one digit). 0 is every talkgroup. In Priority scan, the first talkgroup listed has the highest priority in this item.
     #[serde(deserialize_with = "patterns")]
     #[schemars(with = "Vec<String>", extend("x-talkgroups" = true))]
     pub talkgroups: Vec<String>,
@@ -137,6 +142,62 @@ fn entry_matches(entry: &str, talkgroup: u32) -> bool {
 /// Every channel of the settings, checked. The first error names its channel.
 pub fn compile_all(config: &Config) -> Result<Vec<Channel>, String> {
     config.channels.iter().map(Channel::compile).collect()
+}
+
+/// How many characters of talkgroups a channel's summary line shows before it says "+N more".
+const SUMMARY_WIDTH: usize = 64;
+
+impl ScanMode {
+    fn short(self) -> &'static str {
+        match self {
+            ScanMode::Scan => "Scan",
+            ScanMode::PriorityScan => "Priority scan",
+        }
+    }
+}
+
+/// The line a channel's card shows without being opened: its scan mode and its talkgroups as typed, in
+/// priority order. In Priority scan they're joined with ">" (outranks); a long list ends "+N more".
+pub fn sending_line(c: &ChannelConfig) -> String {
+    let mode = c.scan_mode.short();
+    let entries: Vec<String> = c
+        .sources
+        .iter()
+        .flat_map(|r| r.talkgroups.iter())
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| if t == "0" { "every talkgroup".to_string() } else { t.to_string() })
+        .collect();
+    if entries.is_empty() {
+        return format!("{mode} · no talkgroups yet");
+    }
+    let sep = if c.scan_mode == ScanMode::PriorityScan { " > " } else { ", " };
+    let mut shown = String::new();
+    let mut count = 0;
+    for e in &entries {
+        let next = if count == 0 { e.clone() } else { format!("{shown}{sep}{e}") };
+        if count > 0 && next.chars().count() > SUMMARY_WIDTH {
+            break;
+        }
+        shown = next;
+        count += 1;
+    }
+    let rest = entries.len() - count;
+    let more = if rest > 0 { format!("{sep}… +{rest} more") } else { String::new() };
+    format!("{mode} · {shown}{more}")
+}
+
+/// Sets every channel's summary line from its rules. Whether any of them changed.
+pub fn fill_sending(channels: &mut [ChannelConfig]) -> bool {
+    let mut changed = false;
+    for c in channels {
+        let line = sending_line(c);
+        if c.sending != line {
+            c.sending = line;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// IaR's list merged into the saved channels, by ID.
@@ -267,6 +328,46 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_line_lists_talkgroups_in_priority_order() {
+        let mut c = saved("1", "Fire", true, ScanMode::PriorityScan, &["58909", "58910"]);
+        c.sources.push(SourceRule { systems: vec![], talkgroups: vec!["1000-1099".into(), "507*".into()] });
+        assert_eq!(sending_line(&c), "Priority scan · 58909 > 58910 > 1000-1099 > 507*");
+        c.scan_mode = ScanMode::Scan;
+        assert_eq!(sending_line(&c), "Scan · 58909, 58910, 1000-1099, 507*", "scan has no priority, so no >");
+    }
+
+    #[test]
+    fn the_summary_line_says_so_when_there_is_nothing_to_show() {
+        assert_eq!(sending_line(&ChannelConfig::default()), "Scan · no talkgroups yet");
+        let all = saved("1", "All", true, ScanMode::Scan, &["0"]);
+        assert_eq!(sending_line(&all), "Scan · every talkgroup");
+    }
+
+    #[test]
+    fn a_long_summary_line_is_cut_with_a_count() {
+        let tgs: Vec<String> = (58000..58100).map(|n| n.to_string()).collect();
+        let refs: Vec<&str> = tgs.iter().map(String::as_str).collect();
+        let line = sending_line(&saved("1", "Fire", true, ScanMode::PriorityScan, &refs));
+        assert!(line.starts_with("Priority scan · 58000 > 58001 > 58002"), "{line}");
+        assert!(line.ends_with(" > … +92 more"), "8 of the 100 fit: {line}");
+        assert!(line.chars().count() < 100, "short enough for a card: {line}");
+        // One that is long on its own is still shown.
+        let one =
+            sending_line(&saved("1", "Fire", true, ScanMode::Scan, &["12345678901234567890123456789012345678901234567890123456789012345678901234567890"]));
+        assert!(one.contains("1234567890123456789012345678901234567890") && !one.contains("more"), "{one}");
+    }
+
+    #[test]
+    fn filling_summaries_reports_only_a_change() {
+        let mut channels = vec![saved("1", "Fire", true, ScanMode::Scan, &["101"])];
+        assert!(fill_sending(&mut channels), "empty to filled");
+        assert_eq!(channels[0].sending, "Scan · 101");
+        assert!(!fill_sending(&mut channels), "nothing changed, so nothing to save");
+        channels[0].scan_mode = ScanMode::PriorityScan;
+        assert!(fill_sending(&mut channels), "the mode is in the line");
+    }
+
+    #[test]
     fn the_form_has_actions_secret_key_and_talkgroup_fields() {
         let s = trunk_recorder_plugin::schema::schema_for::<Config>();
         assert_eq!(s["x-actions"][0]["id"], "refresh");
@@ -274,6 +375,8 @@ mod tests {
         let channel = &s["properties"]["channels"]["items"];
         assert_eq!(channel["x-title"], "name");
         assert_eq!(channel["properties"]["name"]["readOnly"], true);
+        assert_eq!(channel["properties"]["sending"]["readOnly"], true);
+        assert_eq!(channel["x-summary"], json!(["{sending|Not set up yet}"]), "the card's line is the plugin's summary");
         assert_eq!(channel["properties"]["scanMode"]["enum"], json!(["scan", "priority_scan"]));
         let rule = &channel["properties"]["sources"]["items"];
         assert_eq!(rule["properties"]["systems"]["x-systems"], true);
