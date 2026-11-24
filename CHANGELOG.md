@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1]
 
 - Each channel's card now shows its scan mode and talkgroups, in priority order, without being opened. A long list ends "+N more".
 - The help text explains how Priority scan works: priority runs from the top, inside an item and across items.
