@@ -39,6 +39,11 @@ pub struct LinkStats {
     pub last_error: String,
     /// Commands dropped because the link was down or its queue was full.
     pub dropped: u64,
+    /// Audio packets written to the connection, and their bytes, so far.
+    pub packets: u64,
+    pub bytes: u64,
+    /// Unix seconds when the last audio packet was written (0: none yet).
+    pub last_audio: f64,
 }
 
 /// A channel's connection. Dropping it stops the worker after it sends what's queued.
@@ -81,7 +86,7 @@ fn run(url: &str, api_key: &str, rx: mpsc::Receiver<Cmd>, stats: &Mutex<LinkStat
                     s.connects += 1;
                     s.last_error.clear();
                 });
-                let outcome = pump(&mut ws, &rx);
+                let outcome = pump(&mut ws, &rx, stats);
                 update(stats, |s| s.connected = false);
                 match outcome {
                     Ok(()) => return,
@@ -112,13 +117,21 @@ fn run(url: &str, api_key: &str, rx: mpsc::Receiver<Cmd>, stats: &Mutex<LinkStat
 }
 
 /// Send and receive until the plugin drops the link (`Ok`) or the connection fails (`Err`).
-fn pump(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, rx: &mpsc::Receiver<Cmd>) -> Result<(), String> {
+fn pump(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, rx: &mpsc::Receiver<Cmd>, stats: &Mutex<LinkStats>) -> Result<(), String> {
     set_timeouts(ws);
     let mut last_ping = Instant::now();
     loop {
         match rx.recv_timeout(POLL) {
             Ok(Cmd::Control(text)) => ws.send(Message::Text(text.into())).map_err(|e| format!("send failed ({e})"))?,
-            Ok(Cmd::Audio(packet)) => ws.send(Message::Binary(packet.into())).map_err(|e| format!("send failed ({e})"))?,
+            Ok(Cmd::Audio(packet)) => {
+                let len = packet.len() as u64;
+                ws.send(Message::Binary(packet.into())).map_err(|e| format!("send failed ({e})"))?;
+                update(stats, |s| {
+                    s.packets += 1;
+                    s.bytes += len;
+                    s.last_audio = unix_secs();
+                });
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = ws.close(None);
@@ -163,4 +176,8 @@ fn set_timeouts(ws: &WebSocket<MaybeTlsStream<TcpStream>>) {
 
 fn update(stats: &Mutex<LinkStats>, f: impl FnOnce(&mut LinkStats)) {
     f(&mut stats.lock().unwrap_or_else(|p| p.into_inner()));
+}
+
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }

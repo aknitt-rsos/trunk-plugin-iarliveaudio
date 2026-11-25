@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Health shows one row per channel: its connection, its packet count, and how long ago it last sent audio. Data is a running total of bytes sent.
+- Turning every channel off clears the rows instead of leaving old ones showing.
+
 ## [0.1.1]
 
 - Each channel's card now shows its scan mode and talkgroups, in priority order, without being opened. A long list ends "+N more".

@@ -11,7 +11,7 @@ mod iar_api;
 mod opus;
 mod ws;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -83,6 +83,8 @@ pub struct IarLiveAudio {
     found_tx: Sender<Vec<String>>,
     found_rx: Receiver<Vec<String>>,
     warned: HashSet<String>,
+    /// Bytes sent over connections that have since closed, so the total only ever grows.
+    retired_bytes: u64,
 }
 
 impl IarLiveAudio {
@@ -100,6 +102,7 @@ impl IarLiveAudio {
             found_tx,
             found_rx,
             warned: HashSet::new(),
+            retired_bytes: 0,
         };
         p.apply(config)?;
         Ok(p)
@@ -139,7 +142,7 @@ impl IarLiveAudio {
                 }
                 previous => {
                     if let Some(r) = previous {
-                        stop(r);
+                        self.retired_bytes += stop(r);
                     }
                     if wanted {
                         let link = ws::Link::start(&self.endpoints.ws_base, &ch.id, &key);
@@ -149,7 +152,7 @@ impl IarLiveAudio {
             }
         }
         for (_, r) in old {
-            stop(r);
+            self.retired_bytes += stop(r);
         }
         self.routes = routes;
     }
@@ -216,42 +219,55 @@ impl IarLiveAudio {
 
     /// One status line for the interface, and the endpoint's health for the dashboard.
     fn report(&self) {
+        // With nothing connected the channel rows are cleared (an empty report), not left showing what was.
+        let idle = Metrics { bytes_sent: (self.retired_bytes > 0).then_some(self.retired_bytes), ..Default::default() };
         if self.config.api_key.trim().is_empty() {
             self.host.status(State::Warning, "Enter your IaR Live Audio API key, then Refresh channels");
+            self.host.metrics(&idle);
             return;
         }
         if self.routes.is_empty() {
             self.host.status(State::Ok, "No channels are on. Turn one on and add a talkgroup rule.");
+            self.host.metrics(&idle);
             return;
         }
         let mut up = 0;
         let mut problems = Vec::new();
+        // One row per channel: its connection, when it last sent audio, and its packet counts.
+        let mut endpoints = Vec::new();
+        let mut extra = BTreeMap::new();
+        let mut bytes = self.retired_bytes;
+        let now = unix_now();
         for r in &self.routes {
             let st = r.link.stats();
-            if st.connected {
+            let name = label(&r.lane.channel).to_string();
+            let state = if st.connected {
                 up += 1;
+                EndpointState::Up
             } else if !st.last_error.is_empty() {
-                problems.push(format!("{}: {}", label(&r.lane.channel), st.last_error));
+                problems.push(format!("{name}: {}", st.last_error));
+                EndpointState::Down
+            } else {
+                EndpointState::Unknown
+            };
+            bytes += st.bytes;
+            endpoints.push(Endpoint {
+                name: name.clone(),
+                state,
+                last_ok: (st.last_audio > 0.0).then_some(st.last_audio),
+                last_error: st.last_error.clone(),
+                ..Default::default()
+            });
+            extra.insert(format!("{name} packets"), json!(st.packets));
+            if st.last_audio > 0.0 {
+                extra.insert(format!("{name} last audio"), json!(ago(now, st.last_audio)));
             }
         }
         let total = self.routes.len();
         let (state, message) =
             if problems.is_empty() { (State::Ok, format!("{up} of {total} channel(s) connected")) } else { (State::Warning, problems.join("; ")) };
         self.host.status(state, message.clone());
-        let endpoint_state = match (up, problems.is_empty()) {
-            (n, true) if n == total => EndpointState::Up,
-            (0, _) => EndpointState::Down,
-            _ => EndpointState::Degraded,
-        };
-        self.host.metrics(&Metrics {
-            endpoints: vec![Endpoint {
-                name: "IaR Live Audio".into(),
-                state: endpoint_state,
-                last_error: problems.first().cloned().unwrap_or_default(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        self.host.metrics(&Metrics { endpoints, bytes_sent: Some(bytes), extra, ..Default::default() });
     }
 }
 
@@ -365,10 +381,12 @@ fn deliver(r: &Route, cmds: Vec<Cmd>) {
     }
 }
 
-/// Ends a route's transmission before its connection is dropped.
-fn stop(mut r: Route) {
+/// Ends a route's transmission before its connection is dropped. Returns the bytes it had sent, so
+/// the plugin's total doesn't fall when a channel is turned off.
+fn stop(mut r: Route) -> u64 {
     let cmds = r.lane.reset(unix_now());
     deliver(&r, cmds);
+    r.link.stats().bytes
 }
 
 /// A channel's name for messages: its IaR name, else its ID.
@@ -401,6 +419,21 @@ fn source_label(call: Option<&Call>, talkgroup: u32, multi: bool) -> String {
 
 fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// How long ago `then` was, as the interface says it: "just now", "12 s ago", "5 min ago", "2 h 10 min ago".
+fn ago(now: f64, then: f64) -> String {
+    let s = (now - then).max(0.0) as u64;
+    match s {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{s} s ago"),
+        60..=3599 => format!("{} min ago", s / 60),
+        3600..=86_399 => match (s / 3600, s % 3600 / 60) {
+            (h, 0) => format!("{h} h ago"),
+            (h, m) => format!("{h} h {m} min ago"),
+        },
+        _ => format!("{} d ago", s / 86_400),
+    }
 }
 
 /// A random ID for this run, sent with every transmission.
@@ -593,6 +626,91 @@ mod tests {
         p.call_end(call(1, 101, 1, None));
         let got = drain(&ws, Duration::from_millis(800));
         assert_eq!(texts(&got)[1]["sourceName"], "TG 101 Engine 1");
+    }
+
+    /// The newest health report the plugin has sent.
+    fn last_metrics(cap: &testing::Captured) -> Metrics {
+        cap.output()
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                PluginMessage::Metrics(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("a health report")
+    }
+
+    /// Waits until the first channel's connection has written `n` audio packets (the server having
+    /// received them doesn't mean the worker has counted them yet).
+    fn wait_for_packets(p: &IarLiveAudio, n: u64) {
+        for _ in 0..100 {
+            if p.routes[0].link.stats().packets >= n {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{n} packets were never counted");
+    }
+
+    /// One 120 ms call on talkgroup 101, sent and counted.
+    fn send_a_call(p: &mut IarLiveAudio, ws: &Receiver<Message>) {
+        p.call_start(call(7, 101, 1, Some((1234, "Engine 1"))));
+        p.audio(audio(7, 101, 1, 960));
+        p.call_end(call(7, 101, 1, None));
+        drain(ws, Duration::from_millis(800));
+        wait_for_packets(p, 2);
+    }
+
+    #[test]
+    fn each_channel_is_a_row_with_its_packets_and_when_it_last_sent_audio() {
+        let (mut p, ws, _h, cap, _a) = plugin(settings_with("k", config::ScanMode::Scan, &[(&[], &["101"])]), LISTING);
+        send_a_call(&mut p, &ws);
+        p.report();
+
+        let m = last_metrics(&cap);
+        assert_eq!(m.endpoints.len(), 1, "one channel, one row");
+        let row = &m.endpoints[0];
+        assert_eq!(row.name, label(&p.routes[0].lane.channel), "the row is named for its channel");
+        assert_eq!(row.state, EndpointState::Up);
+        assert!(row.last_ok.is_some_and(|t| t > 0.0), "when it last sent audio");
+        assert_eq!(m.extra[&format!("{} packets", row.name)], json!(2), "two 60 ms frames");
+        let last = m.extra[&format!("{} last audio", row.name)].as_str().expect("text").to_string();
+        assert!(last == "just now" || last.ends_with(" ago"), "said as the interface says it: {last}");
+        assert!(m.bytes_sent.unwrap_or(0) > 0, "the bytes sent");
+    }
+
+    #[test]
+    fn turning_the_channel_off_clears_its_row_but_the_total_never_falls() {
+        let cfg = settings_with("k", config::ScanMode::Scan, &[(&[], &["101"])]);
+        let (mut p, ws, _h, cap, _a) = plugin(cfg.clone(), LISTING);
+        send_a_call(&mut p, &ws);
+        p.report();
+        let before = last_metrics(&cap).bytes_sent.expect("bytes");
+        assert!(before > 0);
+
+        let mut off = cfg;
+        off.channels[0].enabled = false;
+        p.apply(off).expect("settings");
+        p.report();
+        let after = last_metrics(&cap);
+        assert!(after.endpoints.is_empty() && after.extra.is_empty(), "no channel, so no rows left showing");
+        assert_eq!(after.bytes_sent, Some(before), "what was sent stays in the total");
+    }
+
+    #[test]
+    fn how_long_ago_reads_like_the_interface() {
+        let at = |secs: f64| ago(1_000_000.0, 1_000_000.0 - secs);
+        assert_eq!(at(0.0), "just now");
+        assert_eq!(at(4.9), "just now");
+        assert_eq!(at(5.0), "5 s ago");
+        assert_eq!(at(59.0), "59 s ago");
+        assert_eq!(at(60.0), "1 min ago");
+        assert_eq!(at(3599.0), "59 min ago");
+        assert_eq!(at(3600.0), "1 h ago");
+        assert_eq!(at(7800.0), "2 h 10 min ago");
+        assert_eq!(at(86_400.0 * 3.0), "3 d ago");
+        assert_eq!(ago(10.0, 20.0), "just now", "a clock that stepped back is not a negative time");
     }
 
     #[test]

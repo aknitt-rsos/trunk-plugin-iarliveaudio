@@ -35,6 +35,17 @@ When two talkgroups are on the air at once in **Priority scan**, the higher one 
 
 A card's summary line shows the talkgroups in priority order, with `>` meaning "outranks": `Priority scan · 58909 > 58910 > 58421 > … +37 more`. The line is saved by the plugin, so it updates when the plugin is running and settings change.
 
+## Health
+
+The plugin's Health card in Trunk Recorder Pro has one row per channel that is on:
+
+- A light and the state of its connection to IaR: up, down (with the last error), or unknown while it is still connecting.
+- **{channel} packets**: how many 60 ms audio packets that channel has sent since the plugin started.
+- **{channel} last audio**: how long ago it last sent audio (`just now`, `12 s ago`, `5 min ago`).
+- **Data**: bytes of audio sent across all channels. This is a running total: turning a channel off doesn't lower it.
+
+Turning every channel off clears the rows. A channel that is down turns the whole plugin red, so a single bad channel is easy to see.
+
 ## Multisite
 
 If a system is received at more than one site, the plugin streams one copy at a time per talkgroup. It switches sites only after the current one goes quiet, so the channel doesn't get the same audio twice.
