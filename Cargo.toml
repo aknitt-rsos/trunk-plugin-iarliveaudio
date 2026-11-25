@@ -1,6 +1,6 @@
 [package]
 name = "iarliveaudio"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Sends Trunk Recorder Pro call audio directly to IamResponding Live Audio channels."
 license = "GPL-3.0-or-later"
